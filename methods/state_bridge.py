@@ -183,7 +183,10 @@ class StateBridge:
         self.enable_thinking = enable_thinking
         
         self.prefix_strategy = prefix_strategy
-        self.prefix_scale = 1.0
+        self.prefix_scale = float(os.environ.get("PREFIX_SCALE", "1.0"))
+        if self.prefix_scale != 1.0:
+            print(f"*** PREFIX_SCALE={self.prefix_scale}: message content scaled. "
+                  f"0.0 is the null condition, 64 zero vectors with the prompt unchanged ***")
         self.noise_std = noise_std
         self.pool_size = pool_size
         
@@ -194,6 +197,18 @@ class StateBridge:
         self.debug_mode = debug_mode
         self.use_hook = use_hook
         self.agents = default_agents()
+        # Single-agent baseline: run the judger alone with no prefix. This is the reference
+        # point the multi-agent numbers are measured against, and it needs no other change
+        # because has_prefix is already computed from whether a prefix exists.
+        if os.environ.get("SOLO_JUDGER") == "1":
+            self.agents = [a for a in self.agents if a.role == "judger"]
+            print("*** SOLO_JUDGER=1: single-agent baseline, judger only, no prefix ***")
+
+        _s = os.environ.get("ITEM_SEED")
+        self.item_seed = int(_s) if _s else None
+        if self.item_seed is not None:
+            print(f"*** ITEM_SEED={self.item_seed}: generation seeded per item, "
+                  f"independent of worker assignment ***")
         self.prompt_style = getattr(args, "prompt", "sequential") if args else "sequential"
         self.task = getattr(args, "task", "medqa") if args else "medqa"
         self.device = model.device
@@ -500,11 +515,26 @@ class StateBridge:
             )
         
         last_token = seqs[0, -1].item() if seqs.shape[1] > 0 else None
-        eos_token_id = self.model.tokenizer.eos_token_id
+
+        # A model may stop on any id in its generation config, not only the tokenizer's.
+        # Qwen3 lists the tokenizer's id first so a scalar comparison happens to work.
+        # Olmo-3 stops on 100265 while tokenizer.eos_token_id is 100257, so the scalar
+        # version reports every clean finish as a truncation.
+        stop_ids = set()
+        _te = self.model.tokenizer.eos_token_id
+        if _te is not None:
+            stop_ids.add(int(_te))
+        _gc = getattr(getattr(self.model.model, "generation_config", None), "eos_token_id", None)
+        if isinstance(_gc, (list, tuple)):
+            stop_ids.update(int(e) for e in _gc)
+        elif _gc is not None:
+            stop_ids.add(int(_gc))
+
         gen_info = {
             "actual_gen": actual_gen,
             "max_tokens": self.max_new_tokens,
-            "hit_eos": last_token == eos_token_id if last_token is not None else False,
+            "hit_eos": (last_token in stop_ids) if last_token is not None else False,
+            "stop_ids": sorted(stop_ids),
         }
         
         return texts, gen_hidden_seq, gen_token_ids, gen_info
@@ -512,6 +542,13 @@ class StateBridge:
     @torch.no_grad()
     def run_item(self, item: Dict) -> Dict:
         """Run the full 4-agent pipeline on a single item."""
+        # Per-item seeding, not per-worker. The harness does set_seed(seed + gpu_id) once per
+        # worker, so an item's RNG stream depends on how many items that worker processed
+        # first, which depends on scheduling. That makes runs irreproducible across GPU counts
+        # and prevents comparing two arms on common random numbers. Seeding here makes an
+        # item's generation a function of (seed, item) alone.
+        if self.item_seed is not None:
+            set_seed(self.item_seed * 1_000_003 + int(item.get("idx", 0)))
         current_prefix = None
         final_text = ""
         agent_traces = []
@@ -574,10 +611,18 @@ class StateBridge:
                 print(f"{'='*70}\n")
 
             align_time = 0.0
+            # Instrumentation. Initialised before the branch so the judger row carries them too.
+            # `</think>` is one special token in Qwen3 and three ordinary BPE tokens in Olmo-3, so
+            # this exact-subsequence search can silently fail on some families and fall through to
+            # transmitting the tail of the reasoning instead of the conclusion.
+            think_end_pos = -1
+            think_tok_len = 0
+            sent_prefix_tokens = 0
             if agent.role != "judger":
                 align_start = time.time()
                 # Find </think> token position; pass only post-</think> embeddings
                 think_end_token_ids = self.model.tokenizer.encode("</think>", add_special_tokens=False)
+                think_tok_len = len(think_end_token_ids)    
                 
                 think_end_pos = -1
                 if len(think_end_token_ids) > 0:
@@ -604,6 +649,7 @@ class StateBridge:
                         filtered_token_ids = gen_token_ids
                 
                 if filtered_hidden.shape[1] > 0:
+                    sent_prefix_tokens = int(filtered_hidden.shape[1])
                     aligned_embeds = self._align_hidden_sequence(filtered_hidden, filtered_token_ids)
                     if self.collect_viz:
                         _et = self.embedding_layer(filtered_token_ids).float().reshape(-1, self.hidden_size).detach().cpu()
@@ -626,6 +672,10 @@ class StateBridge:
                 "generated_tokens": gen_info.get("actual_gen", 0),
                 "inference_time": round(gen_time, 4),
                 "alignment_time": round(align_time, 4),
+                "think_found": think_end_pos > 0,
+                "think_end_pos": int(think_end_pos),
+                "think_tok_len": int(think_tok_len),
+                "sent_prefix_tokens": int(sent_prefix_tokens),
             })
             
             del gen_hidden_seq, gen_token_ids, generated_texts
