@@ -884,12 +884,13 @@ def gpu_worker(
             
             idx, item = task
             item = dict(item)
-            item["_run_idx"] = idx
+            dataset_idx = int(item.get("_dataset_idx", item.get("idx", idx)))
+            item["_run_idx"] = dataset_idx
             start_t = time.time()
             result = evaluator.run_item(item)
             end_t = time.time()
             result["duration"] = end_t - start_t
-            result["global_idx"] = idx
+            result["global_idx"] = dataset_idx
             result_queue.put((idx, result, gpu_id))
             
             torch.cuda.empty_cache()
@@ -899,7 +900,12 @@ def gpu_worker(
         except Exception as e:
             import traceback
             error_msg = traceback.format_exc()
-            result_queue.put((idx, {"error": str(e), "traceback": error_msg, "global_idx": idx, "idx": idx}, gpu_id))
+            result_queue.put((idx, {
+                "error": str(e),
+                "traceback": error_msg,
+                "global_idx": dataset_idx,
+                "idx": dataset_idx,
+            }, gpu_id))
             torch.cuda.empty_cache()
     
     if config.get("collect_viz", False):
@@ -967,7 +973,7 @@ class ParallelEvaluator:
         
         for i in pending_indices:
             item = data[i].copy()
-            item["idx"] = i
+            item["idx"] = int(item.get("_dataset_idx", i))
             task_queue.put((i, item))
         
         for _ in workers:
@@ -1230,6 +1236,9 @@ def _build_config(cli_args, task_name: str, task_max_tokens: int, run_name: str)
         "collect_viz": cli_args.collect_viz,
         "viz_output": cli_args.viz_output,
         "message_output": message_output,
+        "indices_file": os.path.basename(cli_args.indices_file) if cli_args.indices_file else None,
+        "indices_sha256": getattr(cli_args, "_indices_sha256", None),
+        "selected_item_ids": getattr(cli_args, "_selected_item_ids", None),
         **controls,
     }
 
@@ -1274,6 +1283,44 @@ def load_dataset_by_name(task_name: str) -> List[Dict]:
     return list(dataset_iter)
 
 
+def select_dataset_rows(cli_args, task_name: str) -> List[Dict]:
+    """Load a task and optionally select exact dataset indices from a JSON manifest."""
+    data = load_dataset_by_name(task_name)
+    if cli_args.indices_file is None:
+        if cli_args.limit:
+            data = data[:cli_args.limit]
+        cli_args._indices_sha256 = None
+        cli_args._selected_item_ids = None
+        return data
+
+    if cli_args.limit is not None:
+        raise ValueError("--indices_file and --limit are mutually exclusive")
+
+    indices_path = os.path.abspath(cli_args.indices_file)
+    with open(indices_path, encoding="utf-8") as stream:
+        payload = json.load(stream)
+    item_ids = payload.get("item_ids") if isinstance(payload, dict) else payload
+    if not isinstance(item_ids, list) or not item_ids:
+        raise ValueError("indices file must contain a non-empty item_ids list")
+    if any(type(item_id) is not int for item_id in item_ids):
+        raise ValueError("every selected item id must be an integer")
+    if len(item_ids) != len(set(item_ids)):
+        raise ValueError("selected item ids must be unique")
+    if any(item_id < 0 or item_id >= len(data) for item_id in item_ids):
+        raise ValueError(f"selected item ids must be between 0 and {len(data) - 1}")
+
+    selected = []
+    for item_id in item_ids:
+        item = dict(data[item_id])
+        item["_dataset_idx"] = item_id
+        selected.append(item)
+    with open(indices_path, "rb") as stream:
+        cli_args._indices_sha256 = hashlib.sha256(stream.read()).hexdigest()
+    cli_args._selected_item_ids = item_ids
+    cli_args.indices_file = indices_path
+    return selected
+
+
 def run_single_task(cli_args, task_name: str, gpu_ids: List[int], timestamp: str) -> Dict:
     """Run evaluation on a single task and save results."""
     print(f"\n{'='*60}")
@@ -1281,9 +1328,7 @@ def run_single_task(cli_args, task_name: str, gpu_ids: List[int], timestamp: str
     print(f"{'='*60}")
     
     print(f"Loading {task_name} dataset...")
-    data = load_dataset_by_name(task_name)
-    if cli_args.limit:
-        data = data[:cli_args.limit]
+    data = select_dataset_rows(cli_args, task_name)
     print(f"Loaded {len(data)} samples")
     
     model_size_match = re.search(r'(\d+[Bb])', cli_args.model)
@@ -1331,6 +1376,8 @@ def main():
     parser.add_argument("--run_all", action="store_true", 
                         help="Run all datasets sequentially")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of samples per dataset")
+    parser.add_argument("--indices_file", type=str, default=None,
+                        help="JSON file containing exact dataset item_ids to evaluate")
     parser.add_argument("--output", type=str, default=None, help="Output file path (single task mode)")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
     parser.add_argument("--top_p", type=float, default=0.95, help="Nucleus sampling threshold")
@@ -1369,6 +1416,11 @@ def main():
                         help="Output path for item-linked message tensors (.pt file)")
     
     cli_args = parser.parse_args()
+
+    if cli_args.run_all and cli_args.indices_file is not None:
+        parser.error("--indices_file cannot be used with --run_all")
+    if cli_args.resume and cli_args.indices_file is not None:
+        parser.error("--indices_file cannot currently be used with --resume")
     
     if cli_args.collect_viz and cli_args.viz_output is None:
         model_tag = cli_args.model.split("/")[-1].lower().replace("-", "_")
@@ -1436,9 +1488,7 @@ def main():
         if cli_args.output is None:
             cli_args.output = f"results/{base_name}.json"
         
-        data = load_dataset_by_name(cli_args.task)
-        if cli_args.limit:
-            data = data[:cli_args.limit]
+        data = select_dataset_rows(cli_args, cli_args.task)
         print(f"Loaded {len(data)} samples")
         
         if cli_args.task not in TASK_CONFIG:
