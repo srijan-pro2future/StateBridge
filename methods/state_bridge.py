@@ -688,10 +688,11 @@ class StateBridge:
                     current_prefix = self._process_prefix(aligned_embeds)
                     if self.capture_messages:
                         self.message_records.append({
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "item_id": int(item.get("_run_idx", item.get("idx", -1))),
                             "sender_role": agent.role,
                             "receiver_role": self.agents[self.agents.index(agent) + 1].role,
+                            "handoff_index": self.agents.index(agent),
                             "token_ids": filtered_token_ids[0].detach().cpu(),
                             "source_hidden": filtered_hidden[0].detach().to(torch.bfloat16).cpu(),
                             "aligned_message": aligned_embeds[0].detach().to(torch.bfloat16).cpu(),
@@ -804,7 +805,10 @@ class StateBridge:
         """Extract answer using task-appropriate logic."""
         if self.task in ['mbppplus', 'humanevalplus']:
             return extract_markdown_python_block(text)
-        elif self.task in ["arc_easy", "arc_challenge", "gpqa", "medqa"]:
+        elif self.task == "gpqa":
+            answer = normalize_answer(extract_gsm8k_answer(text))
+            return answer if answer in {"a", "b", "c", "d"} else None
+        elif self.task in ["arc_easy", "arc_challenge", "medqa"]:
             return normalize_answer(extract_gsm8k_answer(text))
         elif self.task in ["winogrande"]:
             return normalize_answer(extract_gsm8k_answer(text))
@@ -1076,9 +1080,9 @@ class ParallelEvaluator:
                     records.extend(gpu_data.get("records", []))
                     os.remove(gpu_path)
             if records:
-                records.sort(key=lambda row: (row["item_id"], row["sender_role"]))
+                records.sort(key=lambda row: (row["item_id"], row.get("handoff_index", 99)))
                 torch.save({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "config": self.config,
                     "records": records,
                 }, message_base)

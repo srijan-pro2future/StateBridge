@@ -1,5 +1,16 @@
 # Release Notes
 
+## Unreleased
+
+### Fixed
+
+- Normalize derived item seeds to the unsigned 32-bit range accepted by NumPy and
+  `PYTHONHASHSEED`.
+- Restrict GPQA predictions to the benchmark's `a`–`d` answer domain so truncated numeric
+  reasoning is not counted as a valid answer.
+- Record an explicit handoff index and preserve causal message order in schema-v2 capture
+  artifacts. Schema-v1 captures remain readable by the parent validator.
+
 ## v0.1.0 — Initial core research release
 
 This is the first public StateBridge release. It provides the core training-free hidden-state alignment method and its evaluation entry point without claiming a complete reproduction package or a stable public API.

@@ -15,6 +15,10 @@ import torch
 
 
 def set_seed(seed: int) -> None:
+    # NumPy and PYTHONHASHSEED only accept unsigned 32-bit seeds. Item-level
+    # seed derivation can exceed that range (for example, smoke seed 9001), so
+    # normalize once and give every RNG the same deterministic value.
+    seed = int(seed) % (2**32)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
