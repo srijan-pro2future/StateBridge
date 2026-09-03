@@ -11,15 +11,19 @@ import torch
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 import argparse
+import hashlib
 import math
+import platform
 import re
 import json
 import os
+import subprocess
 import sys
 from queue import Empty
 from tqdm import tqdm
 from datetime import datetime
 import time
+import transformers
 
 from . import default_agents
 from models import ModelWrapper
@@ -172,6 +176,11 @@ class StateBridge:
         debug_mode: bool = False,
         use_hook: bool = True,
         collect_viz: bool = False,
+        prefix_scale: float = 1.0,
+        solo_judger: bool = False,
+        item_seed: Optional[int] = None,
+        generation_mode: str = "legacy",
+        capture_messages: bool = False,
         args=None,
     ) -> None:
         self.model = model
@@ -183,7 +192,7 @@ class StateBridge:
         self.enable_thinking = enable_thinking
         
         self.prefix_strategy = prefix_strategy
-        self.prefix_scale = float(os.environ.get("PREFIX_SCALE", "1.0"))
+        self.prefix_scale = float(prefix_scale)
         if self.prefix_scale != 1.0:
             print(f"*** PREFIX_SCALE={self.prefix_scale}: message content scaled. "
                   f"0.0 is the null condition, 64 zero vectors with the prompt unchanged ***")
@@ -200,12 +209,11 @@ class StateBridge:
         # Single-agent baseline: run the judger alone with no prefix. This is the reference
         # point the multi-agent numbers are measured against, and it needs no other change
         # because has_prefix is already computed from whether a prefix exists.
-        if os.environ.get("SOLO_JUDGER") == "1":
+        if solo_judger:
             self.agents = [a for a in self.agents if a.role == "judger"]
             print("*** SOLO_JUDGER=1: single-agent baseline, judger only, no prefix ***")
 
-        _s = os.environ.get("ITEM_SEED")
-        self.item_seed = int(_s) if _s else None
+        self.item_seed = item_seed
         if self.item_seed is not None:
             print(f"*** ITEM_SEED={self.item_seed}: generation seeded per item, "
                   f"independent of worker assignment ***")
@@ -215,6 +223,11 @@ class StateBridge:
         
         self.collect_viz = collect_viz
         self.viz_data = {"planner": [], "critic": [], "refiner": []}
+        if generation_mode not in {"legacy", "corrected"}:
+            raise ValueError(f"Unknown generation_mode: {generation_mode}")
+        self.generation_mode = generation_mode
+        self.capture_messages = capture_messages
+        self.message_records = []
         
         self.embedding_layer = model.model.get_input_embeddings()
         self.hidden_size = self.embedding_layer.embedding_dim
@@ -426,10 +439,15 @@ class StateBridge:
         
         try:
             with torch.no_grad():
+                generation_limit = (
+                    input_len + self.max_new_tokens
+                    if self.generation_mode == "legacy"
+                    else self.max_new_tokens
+                )
                 gen_outputs = self.model.model.generate(
                     inputs_embeds=full_embeds,
                     attention_mask=full_mask,
-                    max_new_tokens=input_len + self.max_new_tokens,
+                    max_new_tokens=generation_limit,
                     temperature=self.temperature,
                     top_p=self.top_p,
                     do_sample=True,
@@ -443,18 +461,25 @@ class StateBridge:
         
         seqs = gen_outputs.sequences
         total_len = seqs.shape[1]
-        actual_gen = total_len - full_embeds.shape[1] if total_len > full_embeds.shape[1] else total_len
-        
-        if total_len < input_len:
-            gen_len = total_len
+        if self.generation_mode == "corrected":
+            # For decoder-only generation from inputs_embeds, Transformers returns generated token
+            # ids rather than the input embeddings. The legacy path treated the embedding length as
+            # a token-id prefix, over-allocated generation, and discarded that many generated ids.
             gen_token_ids = seqs
+            gen_len = total_len
+            actual_gen = gen_len
         else:
-            gen_len = total_len - input_len
-            gen_token_ids = seqs[:, input_len:] if gen_len > 0 else seqs[:, :0]
+            actual_gen = total_len - input_len if total_len > input_len else total_len
+            if total_len < input_len:
+                gen_len = total_len
+                gen_token_ids = seqs
+            else:
+                gen_len = total_len - input_len
+                gen_token_ids = seqs[:, input_len:] if gen_len > 0 else seqs[:, :0]
         
         texts = []
         for idx, seq in enumerate(seqs):
-            if total_len < input_len:
+            if self.generation_mode == "corrected" or total_len < input_len:
                 new_tokens = seq
             else:
                 new_tokens = seq[input_len:] if gen_len > 0 else seq
@@ -534,7 +559,11 @@ class StateBridge:
             "actual_gen": actual_gen,
             "max_tokens": self.max_new_tokens,
             "hit_eos": (last_token in stop_ids) if last_token is not None else False,
+            "hit_cap": actual_gen >= self.max_new_tokens,
             "stop_ids": sorted(stop_ids),
+            "raw_sequence_len": total_len,
+            "input_embed_len": input_len,
+            "generation_mode": self.generation_mode,
         }
         
         return texts, gen_hidden_seq, gen_token_ids, gen_info
@@ -657,6 +686,19 @@ class StateBridge:
                         _et1 = aligned_embeds.float().reshape(-1, self.hidden_size).detach().cpu()
                         self.viz_data[agent.role].append({"e_t": _et, "h_t": _ht, "e_t1": _et1})
                     current_prefix = self._process_prefix(aligned_embeds)
+                    if self.capture_messages:
+                        self.message_records.append({
+                            "schema_version": 1,
+                            "item_id": int(item.get("_run_idx", item.get("idx", -1))),
+                            "sender_role": agent.role,
+                            "receiver_role": self.agents[self.agents.index(agent) + 1].role,
+                            "token_ids": filtered_token_ids[0].detach().cpu(),
+                            "source_hidden": filtered_hidden[0].detach().to(torch.bfloat16).cpu(),
+                            "aligned_message": aligned_embeds[0].detach().to(torch.bfloat16).cpu(),
+                            "transmitted_message": current_prefix[0].detach().to(torch.bfloat16).cpu(),
+                            "think_found": think_end_pos > 0,
+                            "think_end_pos": int(think_end_pos),
+                        })
                 align_time = time.time() - align_start
             
             if agent.role == "judger":
@@ -729,6 +771,7 @@ class StateBridge:
         total_inference_time = sum(t.get("inference_time", 0) for t in agent_traces)
         total_alignment_time = sum(t.get("alignment_time", 0) for t in agent_traces)
 
+        judger_info = agent_traces[-1].get("gen_info", {}) if agent_traces else {}
         return {
             "question": item["question"],
             "gold": gold,
@@ -737,6 +780,12 @@ class StateBridge:
             "prediction_1": pred_1,
             "correct": correct,
             "correct_1": correct_1,
+            "outcome": {
+                "completed": bool(judger_info.get("hit_eos", False)),
+                "hit_cap": bool(judger_info.get("hit_cap", False)),
+                "valid_answer": pred is not None and str(pred) != "",
+                "receiver_generated_tokens": int(judger_info.get("actual_gen", 0)),
+            },
             "final_response": final_text,
             "idx": item.get("idx", -1),
             "trace": agent_traces,
@@ -806,6 +855,7 @@ def gpu_worker(
         model,
         max_new_tokens=config["max_new_tokens"],
         temperature=config["temperature"],
+        top_p=config.get("top_p", 0.95),
         max_prefix_tokens=config["max_prefix_tokens"],
         prefix_strategy=config.get("prefix_strategy", "scale"),
         enable_thinking=config["enable_thinking"],
@@ -814,6 +864,11 @@ def gpu_worker(
         debug_mode=config.get("debug_mode", False),
         use_hook=config.get("use_hook", True),
         collect_viz=config.get("collect_viz", False),
+        prefix_scale=config.get("prefix_scale", 1.0),
+        solo_judger=config.get("solo_judger", False),
+        item_seed=config.get("item_seed"),
+        generation_mode=config.get("generation_mode", "legacy"),
+        capture_messages=config.get("capture_messages", False),
         args=args,
     )
     
@@ -824,6 +879,8 @@ def gpu_worker(
                 break
             
             idx, item = task
+            item = dict(item)
+            item["_run_idx"] = idx
             start_t = time.time()
             result = evaluator.run_item(item)
             end_t = time.time()
@@ -847,6 +904,11 @@ def gpu_worker(
             viz_base = config.get("viz_output", "results/alignment_viz.pt")
             gpu_path = viz_base.replace(".pt", f"_gpu{gpu_id}.pt")
             torch.save({"viz_data": viz_data}, gpu_path)
+
+    if config.get("capture_messages", False) and evaluator.message_records:
+        message_base = config.get("message_output", "results/messages.pt")
+        gpu_path = message_base.replace(".pt", f"_gpu{gpu_id}.pt")
+        torch.save({"records": evaluator.message_records}, gpu_path)
 
 
 class ParallelEvaluator:
@@ -1003,6 +1065,26 @@ class ParallelEvaluator:
                     "transitions": final_viz,
                 }, viz_base)
                 self.logger.log(f"Alignment viz data saved to {viz_base}")
+
+        if self.config.get("capture_messages", False):
+            message_base = self.config.get("message_output", "results/messages.pt")
+            records = []
+            for gid in self.gpu_ids:
+                gpu_path = message_base.replace(".pt", f"_gpu{gid}.pt")
+                if os.path.exists(gpu_path):
+                    gpu_data = torch.load(gpu_path, map_location="cpu", weights_only=False)
+                    records.extend(gpu_data.get("records", []))
+                    os.remove(gpu_path)
+            if records:
+                records.sort(key=lambda row: (row["item_id"], row["sender_role"]))
+                torch.save({
+                    "schema_version": 1,
+                    "config": self.config,
+                    "records": records,
+                }, message_base)
+                self.logger.log(
+                    f"Captured {len(records)} item-linked messages to {message_base}"
+                )
         
         self.logger.log("")
         self.logger.log("GPU Statistics:")
@@ -1042,6 +1124,17 @@ class ParallelEvaluator:
             "correct_1": correct_count_1,
             "accuracy_1": accuracy_1,
             "config": self.config,
+            "config_hash": hashlib.sha256(
+                json.dumps(self.config, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+            "provenance": {
+                "git_sha": _git_revision(),
+                "python": platform.python_version(),
+                "torch": torch.__version__,
+                "transformers": transformers.__version__,
+                "cuda": torch.version.cuda,
+                "gpu_ids": self.gpu_ids,
+            },
             "results": results_sorted,
             "timestamp": datetime.now().isoformat(),
         }
@@ -1072,6 +1165,81 @@ TASK_CONFIG = {
     "medqa": {"max_new_tokens": 8192},
     "winogrande": {"max_new_tokens": 2048},
 }
+
+
+def _resolve_controls(cli_args) -> Dict:
+    """Resolve explicit CLI controls, retaining environment compatibility for old launchers."""
+    env_scale = float(os.environ.get("PREFIX_SCALE", "1.0"))
+    env_solo = os.environ.get("SOLO_JUDGER") == "1"
+    env_item_seed = os.environ.get("ITEM_SEED")
+
+    explicit_condition = cli_args.condition is not None
+    condition = cli_args.condition
+    if condition is None:
+        condition = "solo" if env_solo else ("null" if env_scale == 0.0 else "real")
+
+    prefix_scale = cli_args.prefix_scale
+    if prefix_scale is None:
+        prefix_scale = (
+            (0.0 if condition == "null" else 1.0)
+            if explicit_condition
+            else env_scale
+        )
+
+    item_seed = cli_args.item_seed
+    if item_seed is None and env_item_seed:
+        item_seed = int(env_item_seed)
+    if item_seed is None:
+        item_seed = cli_args.seed
+
+    return {
+        "condition": condition,
+        "prefix_scale": float(prefix_scale),
+        "solo_judger": condition == "solo",
+        "item_seed": item_seed,
+        "generation_mode": cli_args.generation_mode,
+        "capture_messages": cli_args.capture_messages,
+    }
+
+
+def _build_config(cli_args, task_name: str, task_max_tokens: int, run_name: str) -> Dict:
+    controls = _resolve_controls(cli_args)
+    message_output = cli_args.message_output
+    if controls["capture_messages"] and message_output is None:
+        message_output = f"results/{run_name}_messages.pt"
+    return {
+        "schema_version": 2,
+        "model_name": cli_args.model,
+        "task": task_name,
+        "prompt": cli_args.prompt,
+        "max_new_tokens": task_max_tokens,
+        "temperature": cli_args.temperature,
+        "top_p": cli_args.top_p,
+        "max_prefix_tokens": cli_args.max_prefix_tokens,
+        "prefix_strategy": "scale",
+        "enable_thinking": True,
+        "adaptive_reg": cli_args.adaptive_reg,
+        "snap_ratio": cli_args.snap_ratio,
+        "debug_mode": cli_args.debug,
+        "use_hook": cli_args.use_hook,
+        "seed": cli_args.seed,
+        "collect_viz": cli_args.collect_viz,
+        "viz_output": cli_args.viz_output,
+        "message_output": message_output,
+        **controls,
+    }
+
+
+def _git_revision() -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def load_dataset_by_name(task_name: str) -> List[Dict]:
@@ -1135,23 +1303,7 @@ def run_single_task(cli_args, task_name: str, gpu_ids: List[int], timestamp: str
         task_max_tokens = TASK_CONFIG[task_name]["max_new_tokens"]
     print(f"Max new tokens for {task_name}: {task_max_tokens}")
     
-    config = {
-        "model_name": cli_args.model,
-        "task": task_name,
-        "prompt": cli_args.prompt,
-        "max_new_tokens": task_max_tokens,
-        "temperature": cli_args.temperature,
-        "max_prefix_tokens": cli_args.max_prefix_tokens,
-        "prefix_strategy": "scale",
-        "enable_thinking": True,
-        "adaptive_reg": cli_args.adaptive_reg,
-        "snap_ratio": cli_args.snap_ratio,
-        "debug_mode": cli_args.debug,
-        "use_hook": cli_args.use_hook,
-        "seed": cli_args.seed,
-        "collect_viz": getattr(cli_args, 'collect_viz', False),
-        "viz_output": getattr(cli_args, 'viz_output', None),
-    }
+    config = _build_config(cli_args, task_name, task_max_tokens, run_name)
     
     evaluator = ParallelEvaluator(
         model_name=cli_args.model,
@@ -1177,6 +1329,7 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Limit number of samples per dataset")
     parser.add_argument("--output", type=str, default=None, help="Output file path (single task mode)")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
+    parser.add_argument("--top_p", type=float, default=0.95, help="Nucleus sampling threshold")
     parser.add_argument("--max_prefix_tokens", type=int, default=64, help="Max prefix tokens")
     parser.add_argument("--adaptive_reg", type=float, default=1e-3, help="Regularization for covariance whitening")
     parser.add_argument("--snap_ratio", type=float, default=0.3, help="Snap-to-nearest-embedding ratio")
@@ -1191,6 +1344,14 @@ def main():
     parser.add_argument("--no_hook", dest="use_hook", action="store_false",
                         help="Use output_hidden_states instead of hook")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--item_seed", type=int, default=None,
+                        help="Per-item seed used for worker-independent paired decoding")
+    parser.add_argument("--condition", choices=["real", "null", "solo"], default=None,
+                        help="Message intervention; supersedes legacy environment switches")
+    parser.add_argument("--prefix_scale", type=float, default=None,
+                        help="Explicit prefix scale (null sets this to zero by default)")
+    parser.add_argument("--generation_mode", choices=["legacy", "corrected"], default="legacy",
+                        help="Legacy reproduces released slicing; corrected is for new experiments")
     parser.add_argument("--max_new_tokens", type=int, default=None, help="Override max_new_tokens")
     parser.add_argument("--result_prefix", type=str, default=None, 
                         help="Custom prefix for result files")
@@ -1198,6 +1359,10 @@ def main():
                         help="Collect alignment vectors for visualization")
     parser.add_argument("--viz_output", type=str, default=None,
                         help="Output path for viz data (.pt file)")
+    parser.add_argument("--capture_messages", action="store_true",
+                        help="Save item-linked exact messages for SAE training and replay")
+    parser.add_argument("--message_output", type=str, default=None,
+                        help="Output path for item-linked message tensors (.pt file)")
     
     cli_args = parser.parse_args()
     
@@ -1279,23 +1444,7 @@ def main():
         else:
             task_max_tokens = TASK_CONFIG[cli_args.task]["max_new_tokens"]
         
-        config = {
-            "model_name": cli_args.model,
-            "task": cli_args.task,
-            "prompt": cli_args.prompt,
-            "max_new_tokens": task_max_tokens,
-            "temperature": cli_args.temperature,
-            "max_prefix_tokens": cli_args.max_prefix_tokens,
-            "prefix_strategy": "scale",
-            "enable_thinking": True,
-            "adaptive_reg": cli_args.adaptive_reg,
-            "snap_ratio": cli_args.snap_ratio,
-            "debug_mode": cli_args.debug,
-            "use_hook": cli_args.use_hook,
-            "seed": cli_args.seed,
-            "collect_viz": getattr(cli_args, 'collect_viz', False),
-            "viz_output": getattr(cli_args, 'viz_output', None),
-        }
+        config = _build_config(cli_args, cli_args.task, task_max_tokens, base_name)
         
         evaluator = ParallelEvaluator(
             model_name=cli_args.model,

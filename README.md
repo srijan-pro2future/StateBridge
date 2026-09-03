@@ -80,6 +80,26 @@ python -m methods.state_bridge --model Qwen/Qwen3-4B --task gsm8k --gpus 0
 python -m methods.state_bridge --model Qwen/Qwen3-8B --run_all --gpus 0,1,2,3
 ```
 
+### Reproducible research controls
+
+New experiments should state the causal arm, item seed, and generation semantics explicitly. The
+legacy generation mode remains the default so released results can be reproduced; use `corrected` for
+new measurements.
+
+```bash
+python -m methods.state_bridge \
+  --model Qwen/Qwen3-8B --task gpqa --gpus 0,1 \
+  --condition real --seed 1 --item_seed 1 \
+  --generation_mode corrected --max_new_tokens 8192 \
+  --capture_messages --result_prefix acl27_real_b8192_s1
+```
+
+The result JSON records the resolved condition, item seed, prefix scale, generation mode, config hash,
+Git revision and software versions. `--capture_messages` additionally writes an item-linked tensor
+artifact containing the source hidden states, aligned messages and exact tensors delivered to the
+next receiver. `--condition null` preserves the prefix positions but transmits zeros;
+`--condition solo` runs only the judger with no prefix.
+
 Use it in your own pipeline:
 
 ```python
